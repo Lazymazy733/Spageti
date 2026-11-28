@@ -6303,10 +6303,68 @@ async function freeLoadCpu(baseId, onProgress) {
     } }
   };
 }
+/* ---------- Picture reader: lets text-only models "see" ----------
+   Models that can only read text (Free mode, DeepSeek, OpenRouter models without vision) get a written description of each
+   picture instead: a caption plus any text found in it, made on this device by Florence-2 (via Transformers.js).
+   Nothing is uploaded. The first use downloads the reader once; the description is kept with the message. */
+const PIC_REPO = 'onnx-community/Florence-2-base-ft';
+const picReader = { p: null, chain: Promise.resolve() };
+async function picLoad(onStatus) {
+  if (picReader.p) return picReader.p;
+  picReader.p = (async () => {
+    const lib = await cpuLoadLib();
+    try { lib.env.backends.onnx.wasm.proxy = true; } catch {}
+    const found = await freeAdapter();
+    const files = {};
+    const progress = ev => {
+      if (!ev || ev.status !== 'progress' || !ev.file) return;
+      files[ev.file] = { p: +ev.progress || 0, t: +ev.total || 0 };
+      let big = null; for (const f of Object.values(files)) if (!big || f.t > big.t) big = f;
+      if (big && onStatus) onStatus('Setting up the picture reader… ' + Math.round(big.p) + '%  (first time only — it is saved for next time)');
+    };
+    const attempts = (found.adapter ? [{ device: 'webgpu', dtype: { embed_tokens: 'fp16', vision_encoder: 'fp16', encoder_model: 'q4', decoder_model_merged: 'q4' } }] : [])
+      .concat([{ device: 'wasm', dtype: 'q8' }, { device: 'wasm', dtype: 'fp32' }]);
+    let model, lastErr;
+    for (const at of attempts) {
+      try { model = await lib.Florence2ForConditionalGeneration.from_pretrained(PIC_REPO, Object.assign({ progress_callback: progress }, at)); break; }
+      catch (e) { lastErr = e; }
+    }
+    if (!model) throw new Error('Couldn’t set up the picture reader (' + ((lastErr && lastErr.message) || 'download failed') + '). Check your connection, or switch to Claude, Kimi or DeepSeek, which see pictures directly.');
+    const processor = await lib.AutoProcessor.from_pretrained(PIC_REPO), tokenizer = await lib.AutoTokenizer.from_pretrained(PIC_REPO);
+    return { lib, model, processor, tokenizer };
+  })();
+  picReader.p.catch(() => { picReader.p = null; });
+  return picReader.p;
+}
+async function picTask(R, image, task, maxTok) {
+  const vision = await R.processor(image);
+  const text = R.tokenizer(R.processor.construct_prompts(task));
+  const ids = await R.model.generate(Object.assign({}, text, vision, { max_new_tokens: maxTok }));
+  const raw = R.tokenizer.batch_decode(ids, { skip_special_tokens: false })[0];
+  const res = R.processor.post_process_generation(raw, task, image.size);
+  const v = res && res[task];
+  return String(typeof v === 'string' ? v : (v && v.labels ? v.labels.join(' ') : '')).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+// one description for one picture (a Blob); jobs run one at a time
+function picDescribe(blob, onStatus) {
+  const run = async () => {
+    const R = await picLoad(onStatus);
+    const image = await R.lib.RawImage.fromBlob(blob);
+    if (onStatus) onStatus('Looking at the picture…');
+    const cap = await picTask(R, image, '<MORE_DETAILED_CAPTION>', 160);
+    if (onStatus) onStatus('Reading any text in the picture…');
+    const ocr = await picTask(R, image, '<OCR>', 400).catch(() => '');
+    return (cap ? 'What it shows: ' + cap : 'The reader could not describe it.') + '\n' + (ocr ? 'Text in the picture: ' + ocr : 'No readable text found.');
+  };
+  const job = picReader.chain.then(run, run);
+  picReader.chain = job.catch(() => {});
+  return job;
+}
 /* Other hosted models that speak the common "OpenAI-style" chat API (called from this browser with the user's own key). */
 const OAI_PROVIDERS = {
   deepseek: {
     name: 'DeepSeek', base: 'https://api.deepseek.com', keyHint: 'sk-…',
+    vision: true,
     models: [
       { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', note: 'Fast and low-cost · optional step-by-step thinking' },
       { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', note: 'Larger model — DeepSeek may serve this name with V4.1 Flash until V4.1 Pro launches' }
@@ -7210,8 +7268,34 @@ function mountAI(root, tools) {
   }
 
   /* ---------- conversation -> API ---------- */
-  const NO_EYES = 'This model can only read text, so it can’t look at pictures or screen recordings. Switch to Claude or Kimi mode at the top, then press Regenerate.';
+  const NO_EYES = 'This model can only read text, and the on-device picture reader could not describe the attachment. Try again, or switch to Claude, Kimi or DeepSeek mode at the top and press Regenerate.';
   /* fmt: 'text' (Free mode, DeepSeek), 'claude' or 'oai' (these can carry pictures). */
+  // Text-only models: describe the pictures in the newest message on this device first (kept with the message)
+  async function readPictures(history, onStatus) {
+    let last = null; for (const m of history) if (m.role === 'user') last = m;
+    if (!last) return;
+    let did = false;
+    for (const a of (last.attachments || []).filter(isMedia)) {
+      if (a.desc) continue;
+      if (a.kind === 'image') {
+        let b = null; try { b = await blobs.get(a.blob); } catch {}
+        if (!b) continue;
+        a.desc = await picDescribe(b, onStatus); did = true;
+      } else {
+        const fr = a.frames || [], pick = [...new Set([0, Math.floor((fr.length - 1) / 2), fr.length - 1])].filter(i => i >= 0 && fr[i]);
+        const parts = [];
+        for (let k = 0; k < pick.length; k++) {
+          let b = null; try { b = await blobs.get(fr[pick[k]].blob); } catch {}
+          if (!b) continue;
+          if (onStatus) onStatus('Reading the recording… frame ' + (k + 1) + ' of ' + pick.length);
+          parts.push('At ' + aiClock(fr[pick[k]].t) + ' — ' + (await picDescribe(b, null)).replace(/\n/g, ' '));
+        }
+        if (parts.length) { a.desc = parts.join('\n'); did = true; }
+      }
+    }
+    if (did) saveChats();
+  }
+
   async function toApi(history, fmt) {
     const out = [];
     let lastUser = -1; history.forEach((m, i) => { if (m.role === 'user') lastUser = i; });
@@ -7223,6 +7307,7 @@ function mountAI(root, tools) {
       if (docs.length) blocks.push({ type: 'text', text: docs.map(a => '<document title="' + a.title.replace(/"/g, "'") + '">\n' + a.text + '\n</document>').join('\n\n') });
       for (const a of atts.filter(isMedia)) {
         if (fmt === 'text') {
+          if (a.desc) { blocks.push({ type: 'text', text: '[The user attached a ' + (a.kind === 'video' ? 'screen recording' : 'picture') + ' “' + a.title + '”. You cannot see it, but an on-device picture reader described it, so details may be missed:\n' + a.desc + ']' }); continue; }
           if (idx === lastUser) { const e = new Error(NO_EYES); e.freeMode = true; throw e; }
           blocks.push({ type: 'text', text: '[Attached ' + (a.kind === 'video' ? 'screen recording' : 'picture') + ' “' + a.title + '” — not shown to this model]' });
           continue;
@@ -7279,6 +7364,7 @@ function mountAI(root, tools) {
       try { return await freeLoad(base, p => { if (liveMsg === msg) { msg.status = p; paint(); } }, force); }
       catch (e) { e.freeMode = true; throw e; }
     };
+    try { await readPictures(history, p => { if (liveMsg === msg) { msg.status = p; paint(); } }); } catch (e) { e.freeMode = true; throw e; }
     const apiMsgs = trimForFree(await toApi(history, 'text'));
     let engine = await load(false);
     renderModelSel();
@@ -7331,7 +7417,13 @@ function mountAI(root, tools) {
     let modelId = msg.model.slice(pid.length + 1);
     const auto = oaiAuto(pid, c, modelId);
     let host = base; try { host = new URL(base).hostname; } catch {}
-    const apiMsgs = await toApi(history, P.vision ? 'oai' : 'text');
+    // Models that take pictures get them directly. If one turns out not to (a text-only model behind OpenRouter, say),
+    // fall back once to the on-device picture reader, which turns pictures into text for any model.
+    let textMode = !P.vision, res;
+    const hasPics = history.some(m => (m.attachments || []).some(isMedia));
+    for (let pass = 0; ; pass++) {
+    if (textMode) await readPictures(history, p => { if (liveMsg === msg) { msg.status = p; paint(); } });
+    const apiMsgs = await toApi(history, textMode ? 'text' : 'oai');
     const body = { model: modelId, stream: true, stream_options: { include_usage: true },
       messages: [{ role: 'system', content: aiSystemPrompt(cfg.system, null, null, oaiName(msg.model), !cfg.maxTokens, cfg.apps.on) }, ...apiMsgs] };
     const think = pid === 'deepseek' && !!c.think;
@@ -7341,7 +7433,6 @@ function mountAI(root, tools) {
       if (official) { body.thinking = { type: think ? 'enabled' : 'disabled' }; if (think) body.reasoning_effort = 'high'; }
       if (!think) body.temperature = 0.7;
     }
-    let res;
     try {
       const got = await oaiFetch(base, c.key, body, auto ? await orFreeList(controller.signal) : [modelId], controller.signal);
       res = got.res;
@@ -7354,8 +7445,11 @@ function mountAI(root, tools) {
     }
     if (!res.ok) {
       const er = await aiHttpError(res);
+      if (!textMode && pass === 0 && hasPics && [400, 404, 415, 422].includes(er.status) && /image|vision|multimodal|modalit|content|support/i.test(er.message || '')) { textMode = true; toast('This model can’t take pictures directly, so the on-device picture reader will describe them instead.', 5500); continue; }
       if (er.status === 401) { const e2 = new Error(host + ' rejected your API key. A key only works with the service that issued it, so check that the key and the Base URL in Settings belong together (OpenRouter keys start with “sk-or-”, DeepSeek’s with “sk-”).'); e2.freeMode = true; throw e2; }
       throw er;
+    }
+    break;
     }
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = '', thought = 0;
@@ -7570,7 +7664,6 @@ function mountAI(root, tools) {
       await makeImage(chat); return;
     }
     if (needsKey()) { toast('Add your API key first, or switch to Free mode'); openSettings(); return; }
-    if (pending.some(isMedia) && !canSee()) { toast('This mode can only read text. Switch to Claude or Kimi to send pictures and screen recordings.', 6500); return; }
     let chat = activeChat();
     if (!chat) {
       chat = { id: uid(), title: 'New chat', messages: [], created: Date.now(), updated: Date.now() };
@@ -7748,7 +7841,7 @@ function mountAI(root, tools) {
         const p = await aiPrepImage(f);
         pending.push({ kind: 'image', title: name, blob: await keep(p.blob), mime: p.mime, w: p.w, h: p.h });
       }
-      if (!canSee()) toast('Attached. To send it, switch to Claude or Kimi mode — Free mode and DeepSeek can only read text.', 6500);
+      if (!canSee()) toast('Attached. This mode can’t see pictures itself, so an on-device picture reader will describe it first (the first time it downloads a small helper model).', 6500);
     } catch (e) {
       stored.forEach(k => blobs.del(k).catch(() => {}));
       toast(e.message === 'store' ? 'Couldn’t save “' + name + '” in this browser (storage may be full or blocked).'
